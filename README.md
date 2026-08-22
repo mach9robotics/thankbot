@@ -1,281 +1,578 @@
 # ThankBot
 
-An appreciation board for your team. Employees sign in with Google, thank a
-teammate, and everyone sees it on the feed.
+An internal **appreciation board**. Teammates sign in with Google, thank each
+other on the web or with Slack `/thanks`, and the team sees it on a private
+feed and leaderboard.
 
-- **Next.js 14** (App Router) — deployed on Vercel
-- **Supabase** — Postgres for the record of who thanked whom, plus Google auth
-- **Slack** — `/thanks @person for …`, multiple `@mentions`, `everyone` in a
-  channel, or just a reason where one teammate is obvious
+| Layer | Choice |
+|-------|--------|
+| App | **Next.js 14** (App Router), TypeScript, Tailwind — deployed on **Vercel** |
+| Data + auth | **Supabase** (Postgres, RLS, Google OAuth) |
+| Chat | **Slack** slash command `/thanks`, in-channel announcement + card GIF |
 
-## How it works
+---
 
-1. Sign in with Google (Supabase Auth). First login creates the employee's row
-   in `people`, or claims an existing row with the same email.
-2. The home page form posts to `POST /api/thanks`, which sets the sender from
-   the session — never from the request body.
-3. From Slack, `/thanks @alice @bob for …` hits `POST /api/slack/thanks`, which
-   upserts people by `slack_user_id` and writes one card shared by all recipients
-   with `source=slack`. When ThankBot is in the conversation it announces the
-   card with `chat.postMessage` and stores that message's channel and timestamp
-   so the thank-you card page can load Slack emoji and thread replies (the feed
-   does not call Slack). A public channel it was never invited to answers
-   `not_in_channel`, so it joins with `conversations.join` and posts again. If
-   it still cannot post — a private channel or a DM, which an app may not join
-   — it falls back to the slash command's `response_url` and then tries to find
-   that announcement in history. Cards posted before this is deployed have no Slack identity, so
-   their emoji will not appear until you send a new `/thanks`. Slack keeps
-   calling whichever deployment the slash command Request URL points at.
-   List people however
-   you'd write them — `@alice, @bob`, `@alice, @bob, and @carol`, `@alice; @bob`,
-   `@alice & @bob` — the separators belong to the list, not to the reason. You
-   can thank a whole channel with `/thanks everyone for …`, and omit the mention
-   wherever ThankBot can see exactly one other person — including a 1:1 DM with
-   a teammate once `SLACK_USER_TOKEN` is set (see below). Mentions that aren't
-   in the conversation (or don't exist) are skipped and reported back.
-4. On the web, the form's typeahead takes several teammates: pick them from the
-   list, or type (or paste) names separated by commas, semicolons or "and". One
-   send is one card, whoever it names. The feed, leaderboard, and `/people/[id]`
-   pages read from Postgres.
+## Executive summary
 
-## Setup
+ThankBot records *who thanked whom, for what*, so recognition is visible and
+countable instead of trapped in DMs.
 
-### 1. Database
+- **Audience.** One company or workspace. The board is **not public**: pages
+  and most APIs require a signed-in Google session. Slack `/thanks` is the
+  exception (verified by Slack's signing secret).
+- **Value.** One shared card per thanks (including several recipients). A
+  period-filtered feed and leaderboard. Slack posts an announcement plus a
+  public GIF so the moment is visible in-channel; the card page can show
+  Slack emoji and thread replies when the install is complete.
+- **Cost of ownership.** The app is a single Next.js project. Production
+  depends on three consoles **outside this repo**: a hosted Supabase project,
+  a Google OAuth client, and a Slack app. Schema migrations are **not**
+  applied by CI — they must be pushed to the hosted database as part of each
+  release. Slack scopes do nothing until the app is **reinstalled**.
+- **Health.** `GET /api/health` needs no session. It returns `503` when a
+  migration or Slack scope is behind the code. Point an uptime monitor at it.
 
-Run the files in `supabase/migrations/` in order in the Supabase SQL editor (or
-`supabase db push`). Together they create:
+**Current preview deployment** (redirects, slash-command URL, and
+`.env.example` defaults): `https://thankbot.previewmach9.com`. The hosted
+Supabase project is `qewqxlzvlpgmhwibkfig`. Replace both when standing up a
+new environment.
 
-| Object | Purpose |
-|--------|---------|
-| `people` | One row per employee (`email`, `name`, `avatar_url`, optional `auth_user_id`, `slack_user_id`) |
-| `thanks` | One card with a sender, `reason`, `source`, and optional Slack message identity |
-| `thank_recipients` | The people recognized by each card |
-| `people_with_stats` | View adding `thanks_received` / `thanks_given` |
+---
 
-Row Level Security is on: anyone can read the board, but a web thanks can only
-be inserted with `from_person_id` equal to the signed-in user's person row.
-Slack writes use the service role key after verifying Slack's request signature.
+## Setup (outside this repository)
 
-### 2. Google sign-in
+Do this in the vendor consoles **before** (or alongside) cloning the repo. A
+new environment is not "set up" until all four of these exist: **Supabase
+project**, **Google OAuth client**, **Slack app**, **Vercel project** (or
+another Next.js host). The repo only consumes credentials those consoles
+issue.
 
-In the Supabase dashboard → **Authentication → Providers → Google**, add your
-Google OAuth client ID and secret. In the Google Cloud console, set the
-authorized redirect URI to:
+### Prerequisites
 
-```
-https://qewqxlzvlpgmhwibkfig.supabase.co/auth/v1/callback
-```
+- A **Google Cloud** project you can create OAuth clients in (Workspace admin
+  access if you will restrict sign-in to your company).
+- A **Supabase** account (hosted project; free tier is enough to start).
+- A **Slack** workspace you can install apps into, and a Slack app at
+  [api.slack.com/apps](https://api.slack.com/apps).
+- A **Vercel** account (or equivalent) with permission to set env vars and
+  attach a domain.
+- Node.js **20** and **pnpm** **10** on any machine that will run the app
+  (CI uses those versions). Docker + [Supabase CLI](https://supabase.com/docs/guides/cli)
+  only if you want a **local** database instead of the hosted one.
 
-Then under **Authentication → URL Configuration**, set the Site URL to
-`https://thankbot.previewmach9.com` and add these redirect URLs:
+### 1. Hosted Supabase project
 
-```
-https://thankbot.previewmach9.com/auth/callback
-http://localhost:3000/auth/callback
-```
+1. Create a project in the [Supabase dashboard](https://supabase.com/dashboard).
+2. **Project Settings → API**: copy **Project URL**, the **anon / publishable**
+   key, and the **service_role / secret** key. The service role key is a
+   secret: never put it in `NEXT_PUBLIC_*` or client code.
+3. Apply every file in `supabase/migrations/` **in filename order** (SQL
+   editor, or later `pnpm db:push` from a machine that has `supabase link`).
+   Together they create:
 
-To restrict the board to your company, limit the Google OAuth client to your
-Workspace org (external users then can't complete sign-in).
+   | Object | Purpose |
+   |--------|---------|
+   | `people` | One row per employee (`email`, `name`, `avatar_url`, optional `auth_user_id`, `slack_user_id`) |
+   | `thanks` | One card: sender, `reason`, `source`, optional Slack message identity |
+   | `thank_recipients` | People recognized by each card |
+   | `people_with_stats` | View adding `thanks_received` / `thanks_given` |
+   | `create_thanks_card` | RPC that writes a card + recipients in one transaction |
 
-### 3. Slack `/thanks`
+4. Hosted Supabase already grants table privileges to PostgREST roles. You do
+   **not** need `supabase/seed.sql` on the hosted project (that file exists
+   for **local** Docker, where those grants are missing).
+5. Row Level Security is the security boundary: signed-in users can read the
+   board; a web thanks can only be inserted with `from_person_id` equal to
+   the caller's `people` row. Slack and seed writes use the service role
+   after Slack signature verification (or an explicit seed script).
 
-1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps).
-2. Under **OAuth & Permissions**, add bot scopes:
-   - `commands`
-   - `chat:write` (announce the card as ThankBot so the card page can find it)
-   - `channels:join` (add ThankBot to a public channel on its own, so nobody
-     has to run `/invite` first)
-   - `reactions:read` (emoji on that announcement, loaded when someone opens the card)
-   - `channels:history`, `groups:history`, `im:history`, and `mpim:history`
-     (thread replies on the card page)
-   - `users:read`
-   - `users:read.email` (links Slack people to Google logins by email)
-   - `channels:read`, `groups:read`, `im:read`, and `mpim:read` (conversation
-     rosters, so a lone teammate can be thanked without a mention)
+### 2. Google sign-in (Google Cloud + Supabase Auth)
 
-   **Reinstall the app after adding scopes** — Slack keeps honouring the token
-   it already issued, so `/thanks` carries on working while emoji and replies
-   stay invisible. `GET /api/health` lists the scopes an install is still
-   missing.
+ThankBot does not implement OAuth itself. It calls Supabase
+`signInWithOAuth({ provider: "google" })`. You configure Google in two places.
 
-   Slack only shows an app the emoji and replies in conversations it belongs
-   to; there is no bot scope that reads a room from outside. With
-   `channels:join` ThankBot joins a public channel the first time `/thanks` is
-   used there. A **private channel or a DM cannot be joined by an app at all**
-   — see the user token below, which is how those work without anyone running
-   `/invite`.
-3. Under **User Token Scopes**, add `reactions:read`, `channels:history`,
-   `groups:history`, `im:history`, `mpim:history`, and `im:read`.
+**Google Cloud Console**
 
-   A bot token is refused every conversation the app is not in, and an app
-   cannot join a private channel or a DM. A *user* token is not bound that way:
-   it reads whatever its owner can see. So the card page tries the bot token
-   first and falls back to `SLACK_USER_TOKEN`, which is what makes emoji and
-   replies work in private channels and DMs with no invites anywhere. `im:read`
-   is the older half of this, letting `/thanks <reason>` skip the mention in a
-   1:1 DM.
+1. APIs & Services → Credentials → **Create OAuth client ID** (Web
+   application).
+2. Authorized **JavaScript origins**: your site origin (e.g.
+   `https://thankbot.previewmach9.com`, `http://localhost:3000`).
+3. Authorized **redirect URI** must be the **Supabase Auth callback**, not
+   the Next.js app:
 
-   The trade-off: replies read with that token are shown to anyone signed in to
-   the board, including people who are not in the conversation. Leave
-   `SLACK_USER_TOKEN` unset if that is not acceptable, and invite ThankBot to
-   the channels that should collect emoji instead.
-4. Install the app to your workspace and copy the **Bot User OAuth Token** (and
-   the **User OAuth Token** if you added the user scope).
-5. Under **Basic Information**, copy the **Signing Secret**.
-6. Under **Slash Commands**, create `/thanks` pointing at:
+   ```
+   https://<YOUR_PROJECT_REF>.supabase.co/auth/v1/callback
+   ```
 
-```
-https://thankbot.previewmach9.com/api/slack/thanks
-```
+   Example for the current preview project:
 
-For local testing, tunnel your machine (e.g. `ngrok http 3000`) and use that
-URL instead, or set `SLACK_SKIP_VERIFY=true` only on your laptop.
+   ```
+   https://qewqxlzvlpgmhwibkfig.supabase.co/auth/v1/callback
+   ```
 
-Usage in Slack:
+4. Copy the client ID and client secret.
+
+**Supabase dashboard**
+
+1. **Authentication → Providers → Google**: paste the client ID and secret,
+   enable the provider.
+2. **Authentication → URL Configuration**:
+   - **Site URL** = the public app origin (e.g.
+     `https://thankbot.previewmach9.com`).
+   - **Redirect URLs** must include every app callback you will use:
+
+     ```
+     https://thankbot.previewmach9.com/auth/callback
+     http://localhost:3000/auth/callback
+     ```
+
+     Add any extra Vercel preview URLs you actually use for OAuth testing.
+
+3. To keep the board to your company, restrict the **Google OAuth client** to
+   your Workspace org (external accounts then cannot complete sign-in). First
+   login creates a `people` row, or **claims** an existing row with the same
+   email (seeded or Slack-created teammates).
+
+### 3. Slack app (`/thanks`)
+
+1. Create an app at [api.slack.com/apps](https://api.slack.com/apps).
+2. **OAuth & Permissions → Bot Token Scopes** — add all of:
+
+   | Scope | Why |
+   |-------|-----|
+   | `commands` | Slash command |
+   | `chat:write` | Announce the card as ThankBot (card page finds that message) |
+   | `channels:join` | Join a **public** channel on first `/thanks` (no `/invite`) |
+   | `reactions:read` | Emoji on that announcement (loaded on the card page) |
+   | `channels:history`, `groups:history`, `im:history`, `mpim:history` | Thread replies on the card page |
+   | `users:read` | Resolve `@mentions` |
+   | `users:read.email` | Link Slack people to Google logins by email |
+   | `channels:read`, `groups:read`, `im:read`, `mpim:read` | Conversation rosters (thank a lone teammate without a mention) |
+
+   **Reinstall the app after adding scopes.** Slack keeps using the token it
+   already issued. `/thanks` will keep working while emoji and replies stay
+   invisible. `GET /api/health` lists scopes the install is still missing.
+
+3. **User Token Scopes** (optional but required for private channels and DMs
+   without `/invite`): `reactions:read`, `channels:history`, `groups:history`,
+   `im:history`, `mpim:history`, `im:read`.
+
+   A bot token is refused every conversation the app is not in. An app
+   **cannot join** a private channel or a DM. A **user** token reads what its
+   owner can see. The card page tries the bot token first, then
+   `SLACK_USER_TOKEN`. Trade-off: replies read with that token are shown to
+   **anyone signed in to the board**, including people not in the
+   conversation. Leave `SLACK_USER_TOKEN` unset if that is unacceptable, and
+   `/invite @ThankBot` instead.
+
+4. Install the app. Copy **Bot User OAuth Token** (`xoxb-…`), optional
+   **User OAuth Token** (`xoxp-…`), and **Signing Secret** (Basic
+   Information).
+5. **Slash Commands** → create `/thanks` with Request URL:
+
+   ```
+   https://<YOUR_PUBLIC_ORIGIN>/api/slack/thanks
+   ```
+
+   Example: `https://thankbot.previewmach9.com/api/slack/thanks`
+
+   Slack always calls **this URL**. A code change to `/thanks` is live in
+   Slack only when this URL points at a deployment that includes the change.
+   For laptop testing, use a tunnel (`ngrok http 3000`) as the Request URL,
+   or set `SLACK_SKIP_VERIFY=true` **only** on that laptop (never in
+   production).
+
+**Usage**
 
 ```
 /thanks @alex for reviewing my PR
 /thanks @alice @bob for shipping the release
 /thanks everyone for covering on-call   # also: all, everybody, every body
-/thanks for covering standup            # where ThankBot sees one other person
+/thanks for covering standup            # where ThankBot sees exactly one other person
 ```
 
-The last form needs a single obvious recipient. It works in a 1:1 DM with a
-teammate (with `SLACK_USER_TOKEN`), and in any channel or group DM where
-ThankBot is a member and exactly one other person is present. A 1:1 DM with
-ThankBot itself has nobody to thank, so it asks for a mention.
+List people as you would write them: `@alice, @bob`, `@alice, @bob, and
+@carol`, `@alice; @bob`, `@alice & @bob`. Separators belong to the list, not
+the reason. Mentions that are not in the conversation (or do not exist) are
+skipped and reported back.
+
+The no-mention form needs a single obvious recipient: a 1:1 DM with a
+teammate (needs `SLACK_USER_TOKEN`), or a channel/group DM where ThankBot is
+a member and exactly one other person is present. A 1:1 DM with ThankBot
+itself has nobody to thank.
 
 A recorded thanks posts in-channel: Slack `@mention`s each receiver, a
-**View card** link, and a 1-second GIF of the thank-you card with confetti
-(`/thanks/<id>/card.gif`, public so Slack can fetch it).
+**View card** link, and a 1-second GIF (`/thanks/<id>/card.gif`, public so
+Slack's crawler can fetch it without Google).
 
-#### When a card shows no Slack emoji or replies
+### 4. Vercel (or other host) and DNS
 
-Reading emoji and replies takes more than a deploy, and three separate things
-can be missing:
+1. Import this repo. Framework preset: **Next.js** (no extra config).
+2. Set environment variables (see [Environment variables](#environment-variables)).
+   At minimum: `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_SUPABASE_URL`,
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`,
+   `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`. Add `SLACK_USER_TOKEN` if
+   private-channel / 1:1 DM behavior is required.
+3. Attach the public hostname. That exact origin must appear in:
+   - Supabase Site URL + redirect list
+   - Slack slash command Request URL
+   - Google OAuth JavaScript origins (optional but recommended)
+4. Apply any new `supabase/migrations/` files to the **hosted** database as
+   part of the **same** release (`pnpm db:push` or SQL editor). CI does not
+   do this. The app degrades rather than crashing when a migration is
+   outstanding (e.g. a thanks before `0004_group_thanks_recipients.sql` is
+   still recorded, but as one row per recipient instead of one shared card).
+5. Reinstall the Slack app if the release added a bot (or user) scope.
+6. Hit `GET https://<origin>/api/health`. Expect HTTP 200 and `"ok": true`.
+   Point an uptime monitor at it.
 
-- **Scopes.** `reactions:read`, `channels:join`, and the four `*:history`
-  scopes arrived with this feature, and Slack ignores a scope until the app is
-  **reinstalled**.
-- **Membership.** Slack only shows an app a conversation it belongs to.
-  `channels:join` covers public channels; a private channel or a DM is covered
-  by `SLACK_USER_TOKEN`, or by `/invite @ThankBot` if you would rather not set
-  one.
-- **The migration.** `thanks.slack_channel_id` arrived with this feature too,
-  and migrations are applied by hand.
+### Outside-this-repo checklist
 
-Any of them looks exactly like a thread nobody has reacted to. Rather than
-guess, the card page names the reason it found — the scope Slack asked for, a
-conversation ThankBot is not in, an announcement that is no longer there, or an
-outstanding migration. `GET /api/health` answers the same question for the
-whole deployment, before anyone opens a card:
+Copy this into a ticket when standing up a new environment.
 
-```json
-{ "ok": false, "pendingMigrations": [],
-  "slack": { "ok": false, "configured": true,
-             "missingScopes": ["reactions:read", "channels:history"],
-             "user": { "ok": true, "configured": true, "missingScopes": [] } } }
+- [ ] Supabase project created; URL + anon + service_role keys stored in a
+      secret manager (not git)
+- [ ] All `supabase/migrations/*.sql` applied in order on that project
+- [ ] Google OAuth client: redirect = `https://<ref>.supabase.co/auth/v1/callback`
+- [ ] Supabase Google provider enabled; Site URL + `/auth/callback` URLs set
+- [ ] Workspace restriction on the Google client (if the board is internal)
+- [ ] Slack app installed with bot scopes above; **reinstalled** after the
+      last scope change
+- [ ] `/thanks` Request URL = `https://<origin>/api/slack/thanks`
+- [ ] Optional: user token scopes + `SLACK_USER_TOKEN` for private/DM reads
+- [ ] Vercel env vars set; domain live; `/api/health` returns 200
+
+---
+
+## Setup (this repository)
+
+### Humans — laptop against **hosted** Supabase (fastest)
+
+Matches `.env.example` (preview project). You still need Google OAuth
+redirect `http://localhost:3000/auth/callback` on that Supabase project.
+
+```bash
+git clone <this-repo>
+cd thankbot          # directory name may match the clone
+pnpm install
+cp .env.example .env.local
+# Edit .env.local: paste real keys. Do not commit it (.gitignore).
+pnpm seed            # optional demo people + thanks (needs service role)
+pnpm dev
 ```
 
-`slack.user` is present only when `SLACK_USER_TOKEN` is set, since it is
-optional — but a token that cannot read what it is there for fails the check
-just like a missing bot scope.
+Open [http://localhost:3000](http://localhost:3000). Sign in with Google.
 
-### 4. Environment variables
+### Humans — laptop against **local** Supabase (Docker)
+
+Use this when you must not touch the hosted project, or when running DB-backed
+scripts. Docker daemon and Supabase CLI must be installed.
+
+```bash
+# 1. Docker running (Linux VMs often need this; Docker Desktop elsewhere
+#    usually already has a daemon).
+sudo dockerd >/tmp/dockerd.log 2>&1 &   # only if dockerd is not already up
+
+# 2. From the repo root: applies supabase/migrations/* then supabase/seed.sql
+supabase start
+
+# 3. Copy keys from `supabase status` into .env.local
+```
+
+`.env.local` for local stack:
+
+```
+NEXT_PUBLIC_SITE_URL=http://localhost:3000
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<PUBLISHABLE_KEY from supabase status (sb_publishable_…)>
+SUPABASE_SERVICE_ROLE_KEY=<SECRET_KEY from supabase status (sb_secret_…)>
+NEXT_PUBLIC_ALLOW_SELF_THANKS=true
+```
+
+Use the **new-style** keys (`sb_publishable_…` / `sb_secret_…`). Legacy JWT
+`anon` / `service_role` keys printed by `supabase status` are silently
+downgraded to the `anon` role on the local stack and cause **permission
+denied**.
+
+**Gotcha — table grants.** Hosted Supabase auto-grants `public` tables to
+PostgREST roles. Local does **not**. `supabase/seed.sql` reapplies those
+grants and runs after migrations on `supabase start` / `supabase db reset`.
+If you apply migrations by hand locally, run `supabase/seed.sql` or you will
+see `permission denied for table people/thanks`. RLS in the migrations
+remains the real security boundary.
+
+**Google cannot complete locally** unless you also configure a Google client
+against local GoTrue (unusual). To exercise **sending** a thanks without
+Google:
+
+1. Create a user in local GoTrue:
+   `POST http://127.0.0.1:54321/auth/v1/admin/users` with the service role
+   key, JSON `{ "email", "password", "email_confirm": true }`.
+2. `POST /auth/v1/token?grant_type=password` for a session.
+3. Call `POST /api/thanks` with that session cookie / `Authorization`.
+   `getCurrentPerson()` creates or claims the matching `people` row on first
+   authenticated request. `NEXT_PUBLIC_ALLOW_SELF_THANKS=true` lets one user
+   thank themselves.
+
+Then: `pnpm seed && pnpm dev`.
+
+Restart `pnpm dev` after changing `.env.local`. Schema changes from
+`supabase start` / `db reset` do **not** require a Next restart.
+
+### AI agents — actionable setup
+
+Follow this in order. Do not skip Docker for DB-backed tests.
+
+1. Confirm Node 20 + pnpm 10. `pnpm install --frozen-lockfile`.
+2. If `/tmp/cursor/async-install/install-user.status` (or equivalent env
+   bootstrap) exists, wait until it is `0` before assuming deps are ready.
+3. Start Docker if needed (`sudo dockerd >/tmp/dockerd.log 2>&1 &`). Do not
+   change `/etc/docker/daemon.json`.
+4. `supabase start` from repo root. Wait until it finishes (first run pulls
+   images). Then `supabase status` and write `.env.local` with **publishable**
+   and **secret** keys as above. Set `NEXT_PUBLIC_ALLOW_SELF_THANKS=true`.
+5. `pnpm seed` (optional but recommended for a non-empty board).
+6. `pnpm lint` and `pnpm build` (CI equivalents; build needs the public
+   Supabase env vars — placeholders work if the DB is not contacted).
+7. Offline assertion scripts (no DB):
+
+   ```bash
+   pnpm tsx scripts/test-parse.ts
+   pnpm tsx scripts/test-recipient-list.ts
+   pnpm tsx scripts/test-slack-recipients.ts
+   pnpm tsx scripts/test-slack-card-gif.ts
+   pnpm tsx scripts/test-slack-card-activity.ts
+   pnpm tsx scripts/test-time-range.ts
+   ```
+
+8. DB-backed scripts (need local Supabase + `.env.local`):
+
+   ```bash
+   pnpm tsx scripts/test-thanks-write-paths.ts
+   pnpm tsx scripts/test-schema-health.ts
+   pnpm tsx scripts/test-slack-dm-flow.ts
+   pnpm tsx scripts/test-slack-multi-recipient.ts
+   ```
+
+9. `pnpm dev` → `http://localhost:3000`. Home page **requires** a session;
+   unauthenticated browsers land on `/login`. `/api/health` and
+   `/api/slack/thanks` are public. To POST a web thanks, create a local
+   GoTrue user as in the human local section.
+10. Do not commit `.env.local`. Do not put service role or Slack tokens in
+    source. Durable Cloud-agent notes live in `AGENTS.md`; keep product docs
+    in this README.
+
+---
+
+## How it works
+
+1. **Sign-in.** Google via Supabase Auth. Middleware
+   (`src/middleware.ts`) refreshes the session cookie and sends visitors
+   without a session to `/login`, except public paths in
+   `src/lib/auth-paths.ts` (`/login`, `/auth/*`, `/api/slack`, `/api/health`,
+   `/thanks/[id]/card.gif`).
+2. **Web thanks.** Home form posts `POST /api/thanks`. The sender is taken
+   from the session, **never** from the request body. Typeahead accepts
+   several teammates (pick from the list, or type/paste names separated by
+   commas, semicolons, or "and"). One send is one card.
+3. **Slack thanks.** `/thanks …` hits `POST /api/slack/thanks`. People are
+   upserted by `slack_user_id`. One card is shared by all recipients with
+   `source=slack`. ThankBot announces with `chat.postMessage` and stores
+   channel + timestamp so the **card page** (not the feed) can load Slack
+   emoji and thread replies. If a public channel returns `not_in_channel`,
+   it `conversations.join`s and posts again. Private channels and DMs cannot
+   be joined; it falls back to the slash command `response_url`, then tries
+   to find that announcement in history. Cards posted before Slack identity
+   columns existed have no stored message, so their emoji will not appear
+   until a new `/thanks`.
+4. **Reads.** Feed, leaderboard, and `/people/[id]` read Postgres. The
+   leaderboard ranks on the **selected period**, not all-time counts.
+
+### When a card shows no Slack emoji or replies
+
+Three independent gaps look identical to "nobody reacted":
+
+- **Scopes.** New scopes require a **reinstall**.
+- **Membership.** Slack only shows an app conversations it belongs to.
+  `channels:join` covers public channels; private/DM needs `SLACK_USER_TOKEN`
+  or `/invite @ThankBot`.
+- **Schema.** `thanks.slack_channel_id` / `slack_message_ts` come from
+  migrations applied by hand.
+
+The card page names the reason it found. `GET /api/health` answers the same
+for the whole deployment:
+
+```json
+{
+  "ok": false,
+  "pendingMigrations": [],
+  "slack": {
+    "ok": false,
+    "configured": true,
+    "missingScopes": ["reactions:read", "channels:history"],
+    "user": { "ok": true, "configured": true, "missingScopes": [] }
+  }
+}
+```
+
+`slack.user` is present only when `SLACK_USER_TOKEN` is set. A token that
+cannot do the job it is there for fails the check.
+
+---
+
+## Environment variables
 
 ```bash
 cp .env.example .env.local
 ```
 
-| Variable | Notes |
-|----------|-------|
-| `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` locally, the Vercel domain in production |
-| `NEXT_PUBLIC_SUPABASE_URL` | `https://qewqxlzvlpgmhwibkfig.supabase.co` |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase → Project Settings → API |
-| `SUPABASE_SERVICE_ROLE_KEY` | For `pnpm seed` and Slack writes; keep it out of the browser |
-| `SLACK_SIGNING_SECRET` | Slack app → Basic Information → Signing Secret |
-| `SLACK_BOT_TOKEN` | Slack app → OAuth & Permissions → Bot User OAuth Token |
-| `SLACK_USER_TOKEN` | Optional — User OAuth Token. Reads emoji and replies in private channels and DMs an app may not join, and lets its owner skip the mention in their own 1:1 DMs |
-| `SLACK_SKIP_VERIFY` | Local only — skips request signature checks |
-| `NEXT_PUBLIC_ALLOW_SELF_THANKS` | Debug only — set `true` to thank yourself while testing alone |
+| Variable | Who sets it | Notes |
+|----------|-------------|--------|
+| `NEXT_PUBLIC_SITE_URL` | Human / Vercel | Public origin. OAuth `redirectTo` and Slack "View card" links. Local: `http://localhost:3000` |
+| `NEXT_PUBLIC_SUPABASE_URL` | Human / Vercel | Hosted `https://<ref>.supabase.co` or local `http://127.0.0.1:54321` |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Human / Vercel | Anon / publishable key. `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` is also accepted in code |
+| `SUPABASE_SERVICE_ROLE_KEY` | Human / Vercel | Seed + Slack writes + health probes. Server only. `SUPABASE_SECRET_KEY` accepted by `pnpm seed` |
+| `SLACK_SIGNING_SECRET` | Human / Vercel | Slack app → Basic Information |
+| `SLACK_BOT_TOKEN` | Human / Vercel | Bot User OAuth Token (`xoxb-`) |
+| `SLACK_USER_TOKEN` | Human / Vercel | Optional User OAuth Token (`xoxp-`). Private/DM reads and mention-less 1:1 DMs |
+| `SLACK_SKIP_VERIFY` | Human, laptop only | Skips HMAC verification. Never `true` in production |
+| `NEXT_PUBLIC_ALLOW_SELF_THANKS` | Human, debug | `true` to thank yourself. Leave unset/false in production |
 
-### 5. Run it
-
-```bash
-pnpm install
-pnpm seed    # optional demo people + thanks
-pnpm dev
-```
-
-Open [http://localhost:3000](http://localhost:3000).
-
-## Deploying to Vercel
-
-1. Import the repo in Vercel (framework preset: Next.js — no extra config).
-2. Add `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_SUPABASE_URL`,
-   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`,
-   `SLACK_SIGNING_SECRET`, and `SLACK_BOT_TOKEN` as environment variables.
-   Add `SLACK_USER_TOKEN` too if `/thanks <reason>` should work in 1:1 DMs.
-3. Point the domain `thankbot-jol7svuvz.previewmach9.com` at the deployment and
-   make sure the same URL is in Supabase's redirect list and the Slack slash
-   command Request URL.
-4. Apply any new files in `supabase/migrations/` to the hosted project as part
-   of the same release (`pnpm db:push`, or paste them into the SQL editor).
-   Nothing in CI does this for you. The app degrades rather than breaking when a
-   migration is outstanding — a thanks sent before
-   `0004_group_thanks_recipients.sql` is applied is still recorded, but as one
-   row per recipient instead of one shared card.
-5. Reinstall the Slack app if the release added a bot scope. Scopes added in
-   the app config do nothing until the install is redone, and the app keeps
-   working with its old ones, so nothing fails loudly.
-6. Check `GET /api/health` after the deploy. It needs no session and answers
-   `503` with the migrations still to apply and the bot scopes still to grant:
-
-   ```json
-   { "ok": false, "shape": "legacy",
-     "pendingMigrations": ["0004_group_thanks_recipients.sql"],
-     "slack": { "ok": false, "configured": true,
-                "missingScopes": ["reactions:read"] } }
-   ```
-
-   Point an uptime monitor at it and a schema or a Slack install that has
-   fallen behind the code raises an alarm instead of waiting to be found by
-   somebody saying thanks.
-
-Slack keeps talking to whichever deployment its slash command Request URL points
-at, so a change to `/thanks` only shows up in Slack once that deployment is the
-one carrying it.
+---
 
 ## API
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/thanks` | Recent thanks (`?limit=50`) |
-| `POST` | `/api/thanks` | Send thanks — requires a session; body `{ to_person_ids, reason }` (or legacy `to_person_id`) |
-| `POST` | `/api/slack/thanks` | Slack slash command — verified with signing secret |
-| `GET` | `/api/health` | Deploy check — no session needed; `503` while a migration is outstanding |
-| `GET` | `/thanks/[id]` | Card page for one thanks (signed-in) |
-| `GET` | `/thanks/[id]/card.gif` | 1-second thank-you card GIF with confetti (public; Slack embed) |
-| `GET` | `/api/people` | People with received/given counts |
-| `GET` | `/api/people/[id]` | Person + received/given history |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/thanks` | Session | Recent thanks (`?limit=50`) |
+| `POST` | `/api/thanks` | Session | Body `{ to_person_ids, reason }` (or legacy `to_person_id`) |
+| `POST` | `/api/slack/thanks` | Slack signature | Slash command |
+| `GET` | `/api/health` | None | Deploy check; `503` if schema or Slack scopes are behind |
+| `GET` | `/thanks/[id]` | Session | Card page |
+| `GET` | `/thanks/[id]/card.gif` | None | 1-second card GIF (Slack embed) |
+| `GET` | `/api/people` | Session | People with received/given counts |
+| `GET` | `/api/people/[id]` | Session | Person + received/given history |
+
+---
 
 ## Scripts
 
 | Command | Description |
 |---------|-------------|
 | `pnpm dev` | Development server |
-| `pnpm build` | Production build |
+| `pnpm build` | Production build (type-checks the project) |
 | `pnpm start` | Run the production build |
-| `pnpm seed` | Load demo people + thanks (needs service role key) |
-| `pnpm db:push` | Apply `supabase/migrations/` to the linked hosted project |
+| `pnpm seed` | Demo people + thanks (service role) |
+| `pnpm db:push` | Apply `supabase/migrations/` to the **linked hosted** project |
 | `pnpm lint` | ESLint |
-| `pnpm tsx scripts/test-parse.ts` | Slack `/thanks` text parser assertions |
-| `pnpm tsx scripts/test-slack-card-gif.ts` | Slack mention reply + 1-second card GIF |
-| `pnpm tsx scripts/test-slack-recipients.ts` | Recipient resolution for `/thanks` without a mention |
-| `pnpm tsx scripts/test-slack-card-activity.ts` | Slack announcement identity, emoji, and thread replies on the card |
-| `pnpm tsx scripts/test-recipient-list.ts` | Reading a typed or pasted list of names on the web form |
-| `pnpm tsx scripts/test-time-range.ts` | Which month or week the board's period picker means |
-| `pnpm tsx scripts/test-thanks-write-paths.ts` | Web + Slack writes against whichever schema is live (needs local Supabase + `.env.local`) |
-| `pnpm tsx scripts/test-schema-health.ts` | `/api/health` reports the live schema honestly (needs local Supabase + `.env.local`) |
-| `pnpm tsx scripts/test-slack-dm-flow.ts` | Slack DM flow end to end (needs local Supabase + `.env.local`) |
-| `pnpm tsx scripts/test-slack-multi-recipient.ts` | Thanking several people at once end to end (needs local Supabase + `.env.local`) |
+| `pnpm tsx scripts/test-parse.ts` | Slack `/thanks` text parser |
+| `pnpm tsx scripts/test-slack-card-gif.ts` | Mention reply + card GIF |
+| `pnpm tsx scripts/test-slack-recipients.ts` | Recipient resolution without a mention |
+| `pnpm tsx scripts/test-slack-card-activity.ts` | Announcement identity, emoji, replies |
+| `pnpm tsx scripts/test-recipient-list.ts` | Web form typed/pasted name lists |
+| `pnpm tsx scripts/test-time-range.ts` | Board period picker |
+| `pnpm tsx scripts/test-thanks-write-paths.ts` | Web + Slack writes vs live schema (local DB) |
+| `pnpm tsx scripts/test-schema-health.ts` | `/api/health` vs live schema (local DB) |
+| `pnpm tsx scripts/test-slack-dm-flow.ts` | Slack DM flow end to end (local DB) |
+| `pnpm tsx scripts/test-slack-multi-recipient.ts` | Multi-recipient thanks end to end (local DB) |
+
+CI (`.github/workflows/ci.yml`) on `main` and PRs: `pnpm lint`, `pnpm build`,
+and the six scripts that need **no** database. It does **not** deploy (Vercel
+does) and does **not** run DB-backed scripts.
+
+---
+
+## Deploying to Vercel
+
+Human release checklist (AI agents: do not apply hosted migrations or
+reinstall Slack unless the operator asked):
+
+1. Merge to the branch Vercel deploys. Confirm GitHub **CI** is green.
+2. Confirm Vercel env vars match [Environment variables](#environment-variables).
+3. Apply new files in `supabase/migrations/` to the hosted project
+   (`pnpm db:push` after `supabase link`, or paste into the SQL editor).
+4. Reinstall the Slack app if this release added scopes.
+5. Confirm slash command Request URL still points at **this** deployment.
+6. `GET /api/health` → 200. Example failure body:
+
+   ```json
+   {
+     "ok": false,
+     "shape": "legacy",
+     "pendingMigrations": ["0004_group_thanks_recipients.sql"],
+     "slack": {
+       "ok": false,
+       "configured": true,
+       "missingScopes": ["reactions:read"]
+     }
+   }
+   ```
+
+---
+
+## For humans — changing the product
+
+- Prefer small PRs. Schema changes are a **new** file under
+  `supabase/migrations/` (`0007_….sql`, never edit a migration that has
+  already been applied to hosted). Mention in the PR that hosted `db:push`
+  is required.
+- New Slack scopes: document them here, add to health checks in
+  `src/lib/schema-health.ts` / `src/lib/slack.ts`, and tell whoever owns the
+  Slack app to **reinstall**.
+- Web UI lives in `src/app/` and `src/components/`. Slack parsing and posting
+  live in `src/lib/slack.ts` and `src/app/api/slack/thanks/route.ts`.
+- Do not weaken RLS to "make local work"; fix grants via `supabase/seed.sql`
+  locally instead.
+- Self-thanks and `SLACK_SKIP_VERIFY` are debug switches, not production
+  defaults.
+
+---
+
+## For AI agents — changing this codebase
+
+- **Stack facts.** Next.js 14 App Router; server components are
+  `force-dynamic` where they read cookies/DB. Package manager is **pnpm**
+  (see `pnpm-lock.yaml`). Do not add npm/yarn lockfiles.
+- **Do not** invent a test runner. Assertions are standalone
+  `pnpm tsx scripts/test-*.ts` files. If you change parse/recipient/time-range
+  behavior, extend the matching script and run it. If you change write paths
+  or health, run the DB-backed scripts against `supabase start`.
+- **Do not** call hosted Supabase or production Slack from an agent
+  environment unless credentials were explicitly provided for that purpose.
+  Prefer local `supabase start`.
+- **Auth.** Never trust `from_person_id` from the client on web writes.
+  Slack must `verifySlackRequest` before using the service role.
+- **Public surface.** Keep `/api/health` free of board data (no names, rows,
+  or counts). Keep `card.gif` public; keep the rest of `/thanks/[id]`
+  session-gated.
+- **Migrations.** Additive, idempotent where possible (`if not exists`). The
+  app already degrades when `create_thanks_card` is missing — do not remove
+  that fallback without a hard cutover plan.
+- **Env.** Read `src/lib/supabase/env.ts` for key name aliases. After editing
+  `.env.local`, restart `pnpm dev`.
+- **Cursor Cloud.** Extra local-stack notes (dockerd, publishable keys,
+  GoTrue user creation) are in `AGENTS.md`. Do not duplicate secrets there.
+
+---
+
+## Repository map
+
+| Path | Role |
+|------|------|
+| `src/app/` | Routes: board, login, people, thanks card, API, auth callbacks |
+| `src/components/` | Feed, form, leaderboard, Slack activity on a card |
+| `src/lib/db.ts` | Board reads/writes, including migration fallbacks |
+| `src/lib/slack.ts` | Signature verify, parse, post, join, history, health scopes |
+| `src/lib/auth.ts` | Session → `people` row |
+| `src/middleware.ts` | Cookie refresh + login wall |
+| `supabase/migrations/` | Source of truth for hosted **and** local schema |
+| `supabase/seed.sql` | Local PostgREST grants only |
+| `scripts/` | Seed + assertion scripts |
+| `.github/workflows/ci.yml` | Lint, build, offline tests |
+| `AGENTS.md` | Cloud-agent local environment |
+
+---
+
+## License
+
+Private application. All rights reserved unless a `LICENSE` file is added.
