@@ -4,6 +4,10 @@ An internal **appreciation board**. Teammates sign in with Google, thank each
 other on the web or with Slack `/thanks`, and the team sees it on a private
 feed and leaderboard.
 
+This repository is the canonical home of ThankBot. It was migrated from the
+personal repo [mach9-fang/thankbot](https://github.com/mach9-fang/thankbot).
+Use **this** org repo (`mach9robotics/thankbot`) for clones, issues, and PRs.
+
 | Layer | Choice |
 |-------|--------|
 | App | **Next.js 14** (App Router), TypeScript, Tailwind — deployed on **Vercel** |
