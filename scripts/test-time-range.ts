@@ -37,7 +37,7 @@ assert.strictEqual(
 
 // No params, or params nobody would type, fall back to the current period
 // rather than showing an empty board.
-assert.strictEqual(parseTimeRangeParams({}).key, "2026-08");
+assert.strictEqual(parseTimeRangeParams({}).key, currentRange("month").key);
 for (const range of ["", "2026-13", "not-a-month", "2026-8", "20268"]) {
   assert.strictEqual(parseTimeRangeParams({ range }).kind, "month", range);
   assert.strictEqual(
