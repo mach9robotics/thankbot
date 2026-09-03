@@ -39,6 +39,46 @@ new environment.
 
 ---
 
+## This is a migration, not a greenfield app
+
+ThankBot shipped first as a self-contained prototype: an **SQLite** file
+(`better-sqlite3`) on the app server, no accounts, and a Slack slash command
+that wrote rows straight into that file. What this repository holds is the
+**migrated** app. Most of the operating rules below exist because of that
+move, so they are easier to follow if you read them in that light.
+
+- **Data.** SQLite was replaced by a hosted **Supabase** Postgres project;
+  `supabase/migrations/0001_init.sql` is the shape it landed in. Nothing in
+  the repo reads a local database file any more, and prototype rows do not
+  travel with the code. A new environment starts empty until `pnpm seed` runs
+  or `people` / `thanks` are imported.
+- **Identity.** The prototype had no sign-in at all. The migration added
+  Google OAuth through Supabase Auth, Row Level Security on every table, and
+  the login wall in `src/middleware.ts`. A teammate who exists only as a
+  Slack user gets a `people` row, which their first Google login **claims**
+  by email — that claim is the migration path for people, and it is why an
+  email mismatch shows up as a duplicate teammate rather than an error.
+- **Slack.** `/thanks` survived the move, but it now writes through the same
+  Postgres tables using the service role after signature verification, rather
+  than into local storage. It was re-enabled after the web flow settled, so
+  Slack features arrived in layers and each one has its own scope
+  requirement.
+- **Schema, from here on.** The database moves forward as numbered files in
+  `supabase/migrations/` (`0001` … `0006` today), applied **by hand** to the
+  hosted project — CI never applies them. Because that migration sequence is
+  still live, the app is deliberately written to **degrade rather than crash**
+  when the database is behind the code: a thanks sent before
+  `0004_group_thanks_recipients.sql` is still recorded, just as one row per
+  recipient instead of one shared card. `GET /api/health` names whichever
+  files are outstanding.
+
+If you are standing up an environment, read [Setup (outside this
+repository)](#setup-outside-this-repository) as the migration runbook: those
+four vendor consoles hold the state that used to be one file on disk, and
+none of it is recreated by cloning.
+
+---
+
 ## Setup (outside this repository)
 
 Do this in the vendor consoles **before** (or alongside) cloning the repo. A
