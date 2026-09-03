@@ -73,13 +73,10 @@ export function ThanksForm({
   return (
     <form
       onSubmit={handleSubmit}
+      aria-label="Send thanks"
       className="rounded-2xl border border-brand-100 bg-white/80 p-6 shadow-sm"
     >
-      <h2 className="font-[family-name:var(--font-display)] text-xl font-semibold text-ink-900">
-        Say thanks
-      </h2>
-
-      <label className="mt-4 block">
+      <label className="block">
         <span className="text-sm font-medium text-ink-700">To</span>
         <div className="mt-1.5">
           <PersonTypeahead
